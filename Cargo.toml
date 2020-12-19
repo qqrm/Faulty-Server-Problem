@@ -15,3 +15,7 @@ chashmap = "2.2.2"
 lazy_static = "1.4.0"
 envmnt = "0.8.4"
 global = "0.4.3"
+reqwest = { version = "0.10.10", features = ["json"] }
+tokio = { version = "0.3.6", features = ["full"] }
+tokio-timer = "0.2.13"
+futures = { version = "0.3.8", default-features = false }
