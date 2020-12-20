@@ -11,7 +11,7 @@ use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
 use chashmap::CHashMap;
 use envmnt::{ExpandOptions, ExpansionType};
 use nanoid::nanoid;
-use reqwest::{header::HeaderMap, ClientBuilder};
+use reqwest::{ClientBuilder, StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Mutex;
@@ -59,6 +59,11 @@ struct StartParams {
     seconds: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+struct IncomeNum {
+    value: i32,
+}
+
 struct AppState {
     max_pend: Mutex<u64>,
     max_runs: Mutex<u64>,
@@ -72,20 +77,9 @@ async fn runs(data: web::Data<AppState>, start_params: Json<StartParams>) -> imp
     let client = ClientStatus::new();
     &data.clients.insert(id.clone(), client);
 
-
-    let fut = task(id.clone());
-    // let res = actix::run(fut);
+    let fut = task(data.clone(), id.clone(), start_params.seconds );
 
     actix_web::rt::spawn(fut);
-
-    // println!("{:?}", res);
-
-
-    // tokio::
-
-
-
-    // let max_th = &data.max_runs;
 
     HttpResponse::Ok()
         .content_type("application/json")
@@ -108,45 +102,47 @@ async fn run_info(data: web::Data<AppState>, id: Id) -> impl Responder {
         .body(js_resp)
 }
 
-async fn task(id: Id) {
+async fn task(data: web::Data<AppState>, id: Id, seconds: u64) {
     println!("task starterd");
 
     let url = "http://faulty-server-htz-nbg1-1.wvservices.exchange:8080";
     let header = "X-Run-Id";
 
-    // let (tx, rx) = tokio::sync::mpsc::channel();
+    let mut sum = &data.clients.get_mut(&id).unwrap();
 
-    // loop {
-        println!("loop starterd");
-        let new_id = id.clone();
+    for i in 1..= seconds {
+        println!("loop iter {}", i);
         let client = reqwest::Client::new();
         let res = client
             .get(url)
-            .header(header.clone(), new_id.clone())
+            .header(header.clone(), id.clone())
             .send()
-            .await;
+            .await.unwrap();
 
-        println!("res :{:?}", res.unwrap());
 
-        // tx.send(res);
-    // }
+        if res.status().is_success() {
+            println!("res :{:?}", res);
 
-    // let handle = tokio::runtime::Runtime::.unwrap().spawn(process_req);
+            let js = res.json::<IncomeNum>().await.unwrap();
+            println!("res :{:?}", js.value);
+        }
 
-    // Timeout::new(handle, Duration::from_millis(10000));
+        // let resp = res.unwrap().json::<IncomeNum>().await?;
+      
+        // println!("res :{:?}", resp);
 
-    // tokio::runtime::Runtime::new().unwrap().spawn(process_req);
+        // let status = res.status();
+        // match status {
+        //     StatusCode::OK => {
+        //         // sum = sum + = res.unwrap().json()
+        //         println!("val :{:#?}", res.json()?)
+        //     },
+        //     _ =>  println!("other :{:?}", res)
+        // }
 
-    // process_req.timeout(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_secs(1)); //так?🤷‍♂️
 
-    // let res = tokio::time::timeout(dur, j_h).await;
-    // println!("{:?}", res);
-
-    // let process = rx.for_each(|item| {
-    //     println!("{:?}", item);
-    // });
-
-    // Wrap the future with a `Timeout` set to expire in 10 milliseconds.
+    };
 }
 
 #[actix_web::main]
