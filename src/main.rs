@@ -8,51 +8,50 @@ extern crate actix;
 extern crate actix_web;
 
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
-use chashmap::CHashMap;
 use envmnt::{ExpandOptions, ExpansionType};
 use nanoid::nanoid;
-use reqwest::{ClientBuilder, StatusCode, header::HeaderMap};
+use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 use web::Json;
 
-
-
 type Id = String;
-
-// static MAX_PENDING_RUNS: Global<u64> = Global::new();
-// static MAX_CONCURRENT_RUNS: Global<u64> = Global::new();
 
 #[derive(Serialize, Deserialize)]
 struct ClientStatus {
-    status: String,
+    status: Mutex<String>,
     successful_responses_count: u64,
-    sum: i64,
+    sum: Mutex<i64>,
 }
 
 impl ClientStatus {
     fn new() -> ClientStatus {
         ClientStatus {
-            status: "IN_PROGRESS".to_string(),
+            status: Mutex::new("NEW".to_string()),
             successful_responses_count: 0,
-            sum: 0,
+            sum: Mutex::new(0),
         }
     }
 
-    fn add(&mut self, n: i64) {
-        self.successful_responses_count = self.successful_responses_count + 1;
-        self.sum = self.sum + n;
+    pub fn add(&mut self, n: i64) {
+        self.successful_responses_count += 1;
+        *self.sum.get_mut().unwrap() += n;
+    }
+
+    fn set_status(&mut self, status: String) {
+        *self.status.get_mut().unwrap() = status.to_string();
+    }
+
+    pub fn set_in_progress(&mut self) {
+        self.set_status("IN_PROGRESS".to_string());
+    }
+    pub fn set_fin(&mut self) {
+        self.set_status("FINISH".to_string());
     }
 }
-
-// lazy_static! {
-//     static ref CLIENTS: CHashMap<Id, ClientStatus> = {
-//         let map = CHashMap::new();
-//         map
-//     };
-// }
 
 #[derive(Serialize, Deserialize)]
 struct StartParams {
@@ -65,9 +64,12 @@ struct IncomeNum {
 }
 
 struct AppState {
-    max_pend: Mutex<u64>,
-    max_runs: Mutex<u64>,
-    clients: CHashMap<Id, ClientStatus>,
+    max_pend: Mutex<i64>,
+    max_runs: Mutex<i64>,
+    clients: Mutex<HashMap<Id, ClientStatus>>,
+    current_clients: Mutex<i64>,
+    current_clients_pends: Mutex<i64>,
+    pends: Mutex<std::collections::VecDeque<(String, u64)>>,
 }
 
 #[post("/runs")]
@@ -75,25 +77,42 @@ async fn runs(data: web::Data<AppState>, start_params: Json<StartParams>) -> imp
     let id = nanoid!();
 
     let client = ClientStatus::new();
-    &data.clients.insert(id.clone(), client);
+    data.clients.lock().unwrap().insert(id.clone(), client);
 
-    let fut = task(data.clone(), id.clone(), start_params.seconds );
+    if *data.current_clients.lock().unwrap() < *data.max_runs.lock().unwrap() {
+        let fut = task(data.clone(), id.clone(), start_params.seconds);
 
-    actix_web::rt::spawn(fut);
+        actix_web::rt::spawn(fut);
 
-    HttpResponse::Ok()
-        .content_type("application/json")
-        .body(json!({ "id": id }))
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json!({ "id": id }));
+    } else if *data.current_clients_pends.lock().unwrap() < *data.max_pend.lock().unwrap() {
+        *data.current_clients_pends.lock().unwrap() += 1;
+        data.pends
+            .lock()
+            .unwrap()
+            .push_back((id.clone(), start_params.seconds));
+
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json!({ "id": id }));
+    } else {
+        HttpResponse::TooManyRequests().finish()
+    }
 }
 
 #[get("/runs/{id}")]
-async fn run_info(data: web::Data<AppState>, id: Id) -> impl Responder {
-    let js_resp = match &data.clients.get(&id) {
-        Some(client) => json!({
-          "status": (*client).status,
-          "successful_responses_count": (*client).successful_responses_count,
-          "sum": (*client).sum
-        }),
+async fn run_info(data: web::Data<AppState>, path: web::Path<(String,)>) -> impl Responder {
+    let id = path.into_inner().0;
+    let js_resp = match data.clients.lock().unwrap().get(&id) {
+        Some(client) => {
+            json!({
+                "status": (*client).status,
+                "successful_responses_count": (*client).successful_responses_count,
+                "sum": (*client).sum
+            })
+        }
         None => json!({ "err": "id not found" }),
     };
 
@@ -103,61 +122,66 @@ async fn run_info(data: web::Data<AppState>, id: Id) -> impl Responder {
 }
 
 async fn task(data: web::Data<AppState>, id: Id, seconds: u64) {
-    println!("task starterd");
-
     let url = "http://faulty-server-htz-nbg1-1.wvservices.exchange:8080";
     let header = "X-Run-Id";
 
-    let mut sum = &data.clients.get_mut(&id).unwrap();
+    data.clients
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .set_in_progress();
+    *data.current_clients.lock().unwrap() += 1;
 
-    for i in 1..= seconds {
-        println!("loop iter {}", i);
-        let client = reqwest::Client::new();
-        let res = client
+    for _ in 1..=seconds {
+        let res = reqwest::Client::new()
             .get(url)
             .header(header.clone(), id.clone())
             .send()
-            .await.unwrap();
-
+            .await
+            .unwrap();
 
         if res.status().is_success() {
-            println!("res :{:?}", res);
-
             let js = res.json::<IncomeNum>().await.unwrap();
-            println!("res :{:?}", js.value);
+            data.clients
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .add(js.value as i64);
         }
 
-        // let resp = res.unwrap().json::<IncomeNum>().await?;
-      
-        // println!("res :{:?}", resp);
-
-        // let status = res.status();
-        // match status {
-        //     StatusCode::OK => {
-        //         // sum = sum + = res.unwrap().json()
-        //         println!("val :{:#?}", res.json()?)
-        //     },
-        //     _ =>  println!("other :{:?}", res)
-        // }
-
         std::thread::sleep(Duration::from_secs(1)); //так?🤷‍♂️
+    }
 
-    };
+    data.clients.lock().unwrap().get_mut(&id).unwrap().set_fin();
+    *data.current_clients.lock().unwrap() -= 1;
+
+    if data.pends.lock().unwrap().len() != 0 {
+        *data.current_clients_pends.lock().unwrap() -= 1;
+        let pend = data.pends.lock().unwrap().pop_front().unwrap();
+        actix_web::rt::spawn(task(data, pend.0, pend.1));
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let data = web::Data::new(AppState {
-        max_pend: Mutex::new(envmnt::get_u64("MAX_PENDING_RUNS", 5)),
-        max_runs: Mutex::new(envmnt::get_u64("MAX_CONCURRENT_RUNS", 5)),
-        clients: CHashMap::new(),
+        max_pend: Mutex::new(envmnt::get_i64("MAX_PENDING_RUNS", 5)),
+        max_runs: Mutex::new(envmnt::get_i64("MAX_CONCURRENT_RUNS", 5)),
+        clients: Mutex::new(HashMap::new()),
+        current_clients: Mutex::new(0),
+        current_clients_pends: Mutex::new(0),
+        pends: Mutex::new(std::collections::VecDeque::new()),
     });
 
-    HttpServer::new(move || App::new()
-    .app_data(data.clone())
-    .service(runs)
-    .service(run_info))
-        .bind("127.0.0.1:8000")?
-        .run()
-        .await
+    HttpServer::new(move || {
+        App::new()
+            .app_data(data.clone())
+            .service(runs)
+            .service(run_info)
+    })
+    .bind("127.0.0.1:8000")?
+    .run()
+    .await
 }
